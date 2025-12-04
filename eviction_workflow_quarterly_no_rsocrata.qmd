@@ -1,0 +1,450 @@
+---
+title: "Philadelphia Eviction Prediction: Quarterly Data Collection and Processing Workflow"
+author: "Your Name"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  echo: true
+  warning: true
+  message: true
+editor: visual
+---
+
+```{r setup, include=FALSE}
+# Core libraries (install them manually beforehand if needed)
+# install.packages(c("tidycensus", "sf", "dplyr", "readr", "zoo", "lubridate", "ggplot2"))
+
+library(tidycensus)
+library(sf)
+library(dplyr)
+library(readr)
+library(zoo)
+library(lubridate)
+library(ggplot2)
+
+options(scipen = 999, dplyr.summarise.inform = FALSE)
+```
+
+# 1. Research Question and Overview
+
+## 1.1 Core Research Question
+
+**Can we predict quarterly eviction filing counts at the census-tract level 1–3 months (i.e., 1 quarter) in advance, enabling the City of Philadelphia to proactively deploy rental assistance, legal aid resources, and community outreach?**
+
+-   **Spatial Unit:** Census tract
+-   **Temporal Unit:** Quarterly
+-   **Outcome:** Number of eviction filings per tract per quarter
+-   **Model:** Poisson / Negative Binomial (count outcome), or logistic if we binarize high-risk vs low-risk tracts
+
+## 1.2 Why Use Quarterly Data?
+
+-   Monthly eviction filings are often noisy and volatile.
+-   Aggregating to **quarters (3-month periods)** smooths short-term fluctuations and better aligns with:
+    -   Budget cycles
+    -   Program planning cycles
+    -   Policy reporting (quarterly dashboards)
+
+We therefore build a **tract–quarter** modeling dataset, while still allowing lag structures that represent 1, 2, 4 quarters in the past.
+
+------------------------------------------------------------------------
+
+# 2. Workflow Overview
+
+This QMD documents a reproducible workflow to build a tract–quarter modeling dataset:
+
+1.  Download Philadelphia census tract boundaries\
+2.  Collect ACS socioeconomic and housing indicators\
+3.  Collect and aggregate OPA property assessment data (via CSV API, no RSocrata)\
+4.  Construct spatial features (distance to courts; optional transit and crime features)\
+5.  Process eviction records into tract–quarter format\
+6.  Create quarterly lagged eviction variables\
+7.  Merge all data into a final modeling dataset
+
+------------------------------------------------------------------------
+
+# 3. Step 1: Census Tract Boundaries (Spatial Base)
+
+```{r census-tracts}
+# NOTE: Make sure you have set your Census API key once using:
+# tidycensus::census_api_key("YOUR_KEY_HERE", install = TRUE)
+
+philly_tracts <- get_acs(
+  geography = "tract",
+  state = "PA",
+  county = "Philadelphia",
+  variables = "B01001_001",  # total population, used just to get geometry
+  year = 2022,
+  geometry = TRUE
+)
+
+philly_tracts_sf <- philly_tracts %>% 
+  select(GEOID, geometry)
+
+philly_tracts_sf
+```
+
+Optional: save for reuse.
+
+```{r save-tracts, eval=FALSE}
+st_write(philly_tracts_sf, "data/philly_tracts.gpkg", delete_dsn = TRUE)
+```
+
+------------------------------------------------------------------------
+
+# 4. Step 2: ACS Data (Socioeconomic & Housing Indicators)
+
+## 4.1 Define ACS Variables
+
+```{r acs-data}
+# ---- Step 2: ACS Data (Socioeconomic & Housing + Education) ----
+
+acs_vars <- c(
+  # Demographics
+  total_pop          = "B01001_001",
+  white_pop          = "B02001_002",
+  black_pop          = "B02001_003",
+  asian_pop          = "B02001_005",
+  hispanic_pop       = "B03003_003",
+
+  # Economic indicators
+  median_income      = "B19013_001",
+  poverty_total      = "B17001_001",
+  poverty_below      = "B17001_002",
+  unemployment_total = "B23025_002",
+  unemployment_unemployed = "B23025_005",
+
+  # Housing & tenure
+  total_housing_units = "B25001_001",
+  renter_occupied     = "B25003_003",
+  median_rent         = "B25064_001",
+  median_home_value   = "B25077_001",
+
+  # Rent burden distribution
+  rent_30_to_35_pct   = "B25070_007",
+  rent_35_to_40_pct   = "B25070_008",
+  rent_40_to_50_pct   = "B25070_009",
+  rent_50_plus_pct    = "B25070_010",
+
+  # Housing age & vacancy
+  median_year_built   = "B25037_001",
+  vacant_units        = "B25002_003",
+
+  # Education - Less than high school (B15003 table)
+  edu_total           = "B15003_001",
+  less_than_hs_2      = "B15003_002",
+  less_than_hs_3      = "B15003_003",
+  less_than_hs_4      = "B15003_004",
+  less_than_hs_5      = "B15003_005",
+  less_than_hs_6      = "B15003_006",
+  less_than_hs_7      = "B15003_007",
+  less_than_hs_8      = "B15003_008",
+  less_than_hs_9      = "B15003_009",
+  less_than_hs_10     = "B15003_010",
+  less_than_hs_11     = "B15003_011",
+  less_than_hs_12     = "B15003_012",
+  less_than_hs_13     = "B15003_013",
+  less_than_hs_14     = "B15003_014",
+  less_than_hs_15     = "B15003_015",
+  less_than_hs_16     = "B15003_016"
+)
+
+acs_raw <- get_acs(
+  geography = "tract",
+  state = "PA",
+  county = "Philadelphia",
+  variables = acs_vars,
+  year = 2022,
+  output = "wide",
+  geometry = FALSE
+)
+
+acs_final <- acs_raw %>%
+  mutate(
+    # -------------------------
+    # Race composition
+    # -------------------------
+    pct_white     = white_popE     / total_popE * 100,
+    pct_black     = black_popE     / total_popE * 100,
+    pct_hispanic  = hispanic_popE  / total_popE * 100,
+    pct_asian     = asian_popE     / total_popE * 100,
+
+    # -------------------------
+    # Poverty & unemployment
+    # -------------------------
+    poverty_rate      = poverty_belowE / poverty_totalE * 100,
+    unemployment_rate = unemployment_unemployedE / unemployment_totalE * 100,
+
+    # -------------------------
+    # Tenure & rent burden
+    # -------------------------
+    pct_renter        = renter_occupiedE / total_housing_unitsE * 100,
+    rent_burdened     = rent_30_to_35_pctE + rent_35_to_40_pctE +
+                        rent_40_to_50_pctE + rent_50_plus_pctE,
+    pct_rent_burdened = rent_burdened / renter_occupiedE * 100,
+    pct_severe_burden = rent_50_plus_pctE / renter_occupiedE * 100,
+
+    # -------------------------
+    # Education – Less than High School
+    # -------------------------
+    less_than_hs = less_than_hs_2E + less_than_hs_3E + less_than_hs_4E +
+                   less_than_hs_5E + less_than_hs_6E + less_than_hs_7E +
+                   less_than_hs_8E + less_than_hs_9E + less_than_hs_10E +
+                   less_than_hs_11E + less_than_hs_12E + less_than_hs_13E +
+                   less_than_hs_14E + less_than_hs_15E + less_than_hs_16E,
+
+    pct_less_than_hs = less_than_hs / edu_totalE * 100,
+
+    # -------------------------
+    # Housing age
+    # -------------------------
+    property_age  = 2024 - median_year_builtE
+  ) %>%
+  select(
+    GEOID,
+    total_popE,
+    pct_white, pct_black, pct_hispanic, pct_asian,
+    poverty_rate, unemployment_rate,
+    median_incomeE, pct_renter,
+    pct_rent_burdened, pct_severe_burden,
+    pct_less_than_hs,              # <- newly added education variable
+    median_rentE, median_home_valueE,
+    property_age, vacant_unitsE
+  ) %>%
+  rename(
+    total_pop         = total_popE,
+    median_income     = median_incomeE,
+    median_rent       = median_rentE,
+    median_home_value = median_home_valueE,
+    vacant_units      = vacant_unitsE
+  )
+
+head(acs_final)
+write.csv(acs_final, "acs_final.csv", row.names = FALSE)
+
+```
+
+Optional: save.
+
+```{r save-acs, eval=FALSE}
+write_csv(acs_final, "data/acs_tract_data.csv")
+```
+
+------------------------------------------------------------------------
+
+```{r}
+write.csv(acs_final, "acs_final.csv", row.names = FALSE)
+
+```
+
+# 5. Step 3: OPA Property Assessment Data 
+
+We use the Carto SQL API exposed by the City of Philadelphia and read it as CSV.
+
+```{r opa-data, eval=FALSE}
+# NOTE: This URL may need to be updated if the dataset name or schema changes.
+opa_url <- "https://phl.carto.com/api/v2/sql?q=SELECT%20*%20FROM%20opa_properties_public&format=csv"
+
+opa_raw <- read.csv(opa_url)
+
+# Inspect columns to confirm field names
+names(opa_raw)[1:20]
+
+# Summarise to census tract level
+property_summary <- opa_raw %>%
+  filter(!is.na(census_tract)) %>%
+  group_by(census_tract) %>%
+  summarise(
+    n_properties        = n(),
+    avg_market_value    = mean(market_value, na.rm = TRUE),
+    median_market_value = median(market_value, na.rm = TRUE),
+    pct_residential     = mean(category_code_description == "Residential", na.rm = TRUE) * 100
+  ) %>%
+  rename(GEOID = census_tract)
+
+head(property_summary)
+
+# Optional: save
+# write_csv(property_summary, "data/property_summary_by_tract.csv")
+```
+
+> If column names differ (e.g., `market_value`, `category_code_description`), adjust them based on `names(opa_raw)`.
+
+------------------------------------------------------------------------
+
+# 6. Step 4: Spatial Features
+
+## 6.1 Distance to Courts
+
+```{r courts-distance}
+courts <- tibble::tribble(
+  ~name,             ~lat,     ~lon,
+  "Municipal Court", 39.9496, -75.1617,
+  "Civil Court",     39.9526, -75.1652
+  # Add additional court locations as needed
+)
+
+courts_sf <- st_as_sf(courts, coords = c("lon", "lat"), crs = 4326)
+
+tracts_proj  <- st_transform(philly_tracts_sf, 26918)
+courts_proj  <- st_transform(courts_sf, 26918)
+
+tract_centroids <- st_centroid(tracts_proj)
+
+dist_matrix <- st_distance(tract_centroids, courts_proj)
+tract_centroids$dist_to_court_km <- apply(dist_matrix, 1, min) / 1000
+
+dist_to_court <- tract_centroids %>%
+  st_drop_geometry() %>%
+  select(GEOID, dist_to_court_km)
+
+head(dist_to_court)
+```
+
+------------------------------------------------------------------------
+
+# 7. Step 5: From Monthly to Quarterly Evictions + Lag Variables
+
+We assume you have a **monthly** tract-level eviction dataset `evictions_monthly` with:
+
+-   `GEOID` – census tract\
+-   `year_month` – a Date (e.g., `"2020-01-01"`, first day of each month)\
+-   `eviction_filings` – number of filings in that tract and month
+
+We aggregate this to **quarterly** and then create **quarterly lag variables**.
+
+```{r quarterly-evictions, eval=FALSE}
+# Example: read your pre-processed monthly eviction data
+# evictions_monthly <- read_csv("data/evictions_monthly_cleaned.csv")
+
+evictions_quarterly <- evictions_monthly %>%
+  mutate(
+    year    = year(year_month),
+    quarter = quarter(year_month)   # 1, 2, 3, 4
+  ) %>%
+  group_by(GEOID, year, quarter) %>%
+  summarise(
+    eviction_filings = sum(eviction_filings, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(GEOID, year, quarter) %>%
+  mutate(
+    # Convenient label for EDA / plotting
+    year_quarter = paste0(year, " Q", quarter)
+  )
+
+head(evictions_quarterly)
+```
+
+Now create **quarterly lag variables** (lag 1 quarter, 2 quarters, 4 quarters = 1 year):
+
+```{r quarterly-lags, eval=FALSE}
+evictions_with_lags <- evictions_quarterly %>%
+  arrange(GEOID, year, quarter) %>%
+  group_by(GEOID) %>%
+  mutate(
+    evictions_lag1Q  = lag(eviction_filings, 1),  # 1 quarter ago (~3 months)
+    evictions_lag2Q  = lag(eviction_filings, 2),  # 2 quarters (~6 months)
+    evictions_lag4Q  = lag(eviction_filings, 4),  # 4 quarters (~12 months)
+
+    # Rolling means in quarters (e.g., average over last 2 or 4 quarters)
+    evictions_avg_2Q = rollmean(eviction_filings, k = 2, fill = NA, align = "right"),
+    evictions_avg_4Q = rollmean(eviction_filings, k = 4, fill = NA, align = "right")
+  ) %>%
+  ungroup()
+
+head(evictions_with_lags)
+```
+
+------------------------------------------------------------------------
+
+# 8. Step 6: Merge All Data at Tract–Quarter Level
+
+```{r merge-all, eval=FALSE}
+modeling_data <- evictions_with_lags %>%
+  left_join(acs_final,        by = "GEOID") %>%
+  left_join(property_summary, by = "GEOID") %>%
+  left_join(dist_to_court,    by = "GEOID")
+
+# Drop early quarters where lag variables are NA
+modeling_data_complete <- modeling_data %>%
+  filter(!is.na(evictions_lag1Q))
+
+# Optional: save final modeling dataset
+# write_csv(modeling_data_complete, "data/modeling_data_quarterly_final.csv")
+
+summary(select(modeling_data_complete,
+               eviction_filings,
+               evictions_lag1Q,
+               poverty_rate,
+               pct_rent_burdened))
+```
+
+------------------------------------------------------------------------
+
+# 9. Modeling Skeleton (Quarterly NB / Poisson)
+
+We now treat each row as **one tract–quarter**, with a count outcome `eviction_filings`.
+
+```{r model-skeleton, eval=FALSE}
+library(MASS)
+
+modeling_data_complete <- modeling_data_complete %>%
+  mutate(
+    # Create a factor for quarter (seasonality control)
+    quarter_factor = factor(quarter)
+  )
+
+# Time-based split: training on earlier years, testing on latest year
+train_data <- modeling_data_complete %>% filter(year <= 2023)
+test_data  <- modeling_data_complete %>% filter(year == 2024)
+
+nb_model <- glm.nb(
+  eviction_filings ~ 
+    evictions_lag1Q + evictions_lag2Q +
+    pct_rent_burdened + poverty_rate + unemployment_rate +
+    median_income + median_rent +
+    property_age + pct_renter +
+    dist_to_court_km +
+    quarter_factor,
+  data = train_data
+)
+
+summary(nb_model)
+
+test_data$pred_filings <- predict(nb_model, newdata = test_data, type = "response")
+
+mae  <- mean(abs(test_data$eviction_filings - test_data$pred_filings), na.rm = TRUE)
+rmse <- sqrt(mean((test_data$eviction_filings - test_data$pred_filings)^2, na.rm = TRUE))
+
+mae
+rmse
+```
+
+------------------------------------------------------------------------
+
+# 10. Baseline Comparison (Naive “Last Quarter” Model)
+
+To demonstrate value, compare your model against a simple baseline:
+
+```{r baseline, eval=FALSE}
+baseline <- test_data %>%
+  mutate(pred_baseline = evictions_lag1Q)
+
+mae_baseline  <- mean(abs(baseline$eviction_filings - baseline$pred_baseline), na.rm = TRUE)
+rmse_baseline <- sqrt(mean((baseline$eviction_filings - baseline$pred_baseline)^2, na.rm = TRUE))
+
+mae_baseline
+rmse_baseline
+```
+
+If your Negative Binomial model beats this baseline (lower MAE/RMSE), you can tell a strong “Shark Tank” story:
+
+> “Compared to a naive ‘last quarter equals next quarter’ rule-of-thumb, our model reduces forecast error by X%, allowing the City to more accurately target high-risk tracts for early intervention.”
+
+------------------------------------------------------------------------
+
+This QMD is now fully **quarterly-based**, from data aggregation to lag construction and model skeleton, and does **not** rely on RSocrata. You can extend it with EDA, maps, fairness checks, and policy recommendations for your final project.
