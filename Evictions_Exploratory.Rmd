@@ -1,0 +1,415 @@
+---
+title: "Exploratory Analysis -- Eviction Data"
+subtitle: "MUSA 5080 - Fall 2025"
+author: "Alex Stauffer, Xiao Yu, Qianmu Zheng"
+date: "December 1, 2025"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    code_download: true
+    self_contained: true
+    df_print: paged
+---
+
+# Define Themes
+```{r}
+plotTheme <- ggplot2::theme(
+  plot.title = ggplot2::element_text(size = 14, face = "bold"),
+  plot.subtitle = ggplot2::element_text(size = 10),
+  plot.caption = ggplot2::element_text(size = 8),
+  axis.text.x = ggplot2::element_text(size = 10, angle = 45, hjust = 1),
+  axis.text.y = ggplot2::element_text(size = 10),
+  axis.title = ggplot2::element_text(size = 11, face = "bold"),
+  panel.background = ggplot2::element_blank(),
+  panel.grid.major = ggplot2::element_line(colour = "#D0D0D0", size = 0.2),
+  panel.grid.minor = ggplot2::element_blank(),
+  axis.ticks = ggplot2::element_blank(),
+  legend.position = "right"
+)
+
+mapTheme <- ggplot2::theme(
+  plot.title = ggplot2::element_text(size = 14, face = "bold"),
+  plot.subtitle = ggplot2::element_text(size = 10),
+  plot.caption = ggplot2::element_text(size = 8),
+  axis.line = ggplot2::element_blank(),
+  axis.text = ggplot2::element_blank(),
+  axis.ticks = ggplot2::element_blank(),
+  axis.title = ggplot2::element_blank(),
+  panel.background = ggplot2::element_blank(),
+  panel.border = ggplot2::element_blank(),
+  panel.grid.major = ggplot2::element_line(colour = 'transparent'),
+  panel.grid.minor = ggplot2::element_blank(),
+  legend.position = "right",
+  plot.margin = ggplot2::margin(1, 1, 1, 1, 'cm'),
+  legend.key.height = grid::unit(1, "cm"),
+  legend.key.width = grid::unit(0.2, "cm")
+)
+
+palette5 <- c("#eff3ff", "#E1DCF5", "#BBADF0", "#6849BA", "#361AA3")
+```
+
+
+
+# Intro
+blah blah exploratory analysis
+
+## Load Libraries
+```{r load_library echo = FALSE, warning = FALSE, message=FALSE}
+#Core tidyverse
+library(tidyverse)
+library(lubridate)
+
+# Spatial data
+library(sf)
+library(tigris)
+
+# Census data
+library(tidycensus)
+
+# Weather data
+library(riem)  # For Philadelphia weather from ASOS stations
+
+# Visualization
+library(viridis)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(grid)
+library(gridExtra)
+library(patchwork)
+library(tmap)
+
+
+# here!
+library(here)
+# Get rid of scientific notation. We gotta look good!
+options(scipen = 999)
+```
+
+# Get Geography! 
+```{r}
+tracts <- tracts("PA", "Philadelphia", year = 2022, class = "sf") %>%
+  st_transform(2272)
+```
+
+
+
+
+
+
+
+
+# ========== STEP 1: LOAD & FILTER BY QUARTER ==========
+```{r evic_data_loadin echo = FALSE, warning = FALSE, message=FALSE }
+evictions_raw <- read.csv(here("data/philadelphia_weekly_2020_2021.csv"))
+glimpse(philly_tract_monthly)
+```
+```{r parsedates }
+evictions_quarterly <- evictions_raw %>%
+  mutate(
+    week_date = ymd(week_date),
+    year = year (week_date),
+    quarter = quarter(week_date),
+    year_quarter = paste0(year, "-Q", quarter)
+  ) %>%
+  # aggregate to quarterly by tract 
+  group_by(GEOID, year_quarter, year, quarter, racial_majority, filings_avg,filings_avg_prepandemic_baseline, filings_2020) %>%
+  summarize(
+    eviction_filings = sum(filings_2020, na.rm = TRUE),
+    weeks_in_quarter = n(),
+    .groups = "drop"
+  )
+
+cat("Quarterly data created:\n")
+cat("Rows:", nrow(evictions_quarterly), "\n")
+cat("Unique tracts:", n_distinct(evictions_quarterly$GEOID), "\n")
+cat("Time periods:", paste(unique(evictions_quarterly$year_quarter), collapse = ", "), "\n\n")
+cat("Any NA dates after parsing?", sum(is.na(evictions_clean$week_date)), "\n\n")
+```
+# Step 2: Create Lag Vars
+```{r lagvars}
+evictions_with_lags <- evictions_quarterly %>%
+  arrange(GEOID, year_quarter) %>%
+  group_by(GEOID) %>%
+  mutate(
+    # Lag variables (quarters ago)
+    evictions_lag1 = lag(eviction_filings, 1),   # 1 quarter ago
+    evictions_lag2 = lag(eviction_filings, 2),   # 2 quarters ago  
+    evictions_lag4 = lag(eviction_filings, 4),   # 1 year ago
+    
+    # Rolling averages
+    evictions_avg_2q = zoo::rollmean(eviction_filings, k = 2, fill = NA, align = "right"),
+    evictions_avg_4q = zoo::rollmean(eviction_filings, k = 4, fill = NA, align = "right")
+  ) %>%
+  ungroup()
+
+# Check lag creation
+cat("========== LAG VARIABLES CHECK ==========\n")
+cat("Rows with complete lags (lag1):", sum(!is.na(evictions_with_lags$evictions_lag1)), "\n")
+cat("Rows with complete 4-quarter lags:", sum(!is.na(evictions_with_lags$evictions_lag4)), "\n\n")
+```
+
+# Visualization
+
+```{r boxplot_evics}
+
+
+evictions_with_lags %>%
+  mutate(year = substr(year_quarter, 1, 4)) %>%
+  ggplot(aes(x = year, y = eviction_filings)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(
+    title = "Distribution of Quarterly Evictions per Tract (by Year)",
+    x = "Year",
+    y = "Quarterly Eviction Filings"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+```{r citywide vis}
+evictions_with_lags %>%
+  group_by(year_quarter) %>%
+  summarise(total_evictions = sum(eviction_filings)) %>%
+  ggplot(aes(x = year_quarter, y = total_evictions, group = 1)) +
+  geom_line(color = "firebrick", size = 1) +
+  geom_point() +
+  labs(
+    title = "Citywide Quarterly Eviction Filings Over Time",
+    x = "Quarter",
+    y = "Total Filings"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+```{r}
+evictions_with_lags %>%
+  group_by(year_quarter) %>%
+  summarise(
+    avg_2q = mean(evictions_avg_2q, na.rm = TRUE),
+    avg_4q = mean(evictions_avg_4q, na.rm = TRUE)
+  ) %>%
+  ggplot(aes(x = year_quarter, group = 1)) +
+  geom_line(aes(y = avg_2q, color = "2-Quarter Rolling Avg"), size = 1) +
+  geom_line(aes(y = avg_4q, color = "4-Quarter Rolling Avg"), size = 1) +
+  labs(
+    title = "Smoothed Quarterly Eviction Filings Across Philadelphia",
+    x = "Quarter",
+    y = "Rolling Average Eviction Filings",
+    color = "Legend"
+  ) +
+  scale_color_manual(values = c("2-Quarter Rolling Avg" = "blue", 
+                                "4-Quarter Rolling Avg" = "orange")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## join tracts and evictiondata 
+```{r join}
+ev_map <- tracts %>%
+  left_join(evictions_quarterly, by = c("GEOID"))
+```
+
+
+## Average Quarterly Evictions 
+```{r}
+ev_mean <- evictions_quarterly %>%
+  group_by(GEOID) %>%
+  summarise(mean_quarterly = mean(eviction_filings, na.rm = TRUE))
+
+ev_mean_map <- tracts %>%
+  left_join(ev_mean, by = "GEOID")
+
+ggplot(ev_mean_map) +
+  geom_sf(aes(fill = mean_quarterly), color = NA) +
+  scale_fill_viridis_c(option = "magma", direction = -1, name = "Mean\nQuarterly\nEvictions", na.value = "grey90") +
+  labs(title = "Average Quarterly Eviction Filings by Census Tract") +
+  mapTheme
+
+```
+
+Analysis here.
+
+
+## Quarterly Facets Map
+```{r}
+ev_quarter_map <- tracts %>%
+  left_join(evictions_quarterly, by = "GEOID")
+
+ggplot(ev_quarter_map) +
+  geom_sf(aes(fill = eviction_filings), color = NA) +
+  scale_fill_viridis_c(option = "magma", direction = -1, name = "Evictions", na.value = "grey90") +
+  facet_wrap(~ year_quarter) +
+  labs(title = "Quarterly Eviction Filings by Tract",
+       subtitle = "Philadelphia Census Tracts") +
+  mapTheme +
+  theme(strip.text = element_text(size = 9))
+
+```
+THIS NEEDS CHANGED 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r zoning}
+zoning_sf <- st_read(here("data/Zoning_BaseDistricts.shp")) %>%
+  st_transform(2272)
+
+glimpse(zoning)
+unique(zoning_sf$zoninggroup)
+unique(zoning_sf$long_code)
+```
+```{r}
+zoning_res <- zoning_sf %>%
+  filter(
+    zoninggrou == "Residential/Residential Mixed-Use" |
+    grepl("^RM", long_code)  |
+    grepl("^RSA", long_code) |
+    grepl("^RMX", long_code) |
+    grepl("^CMX", long_code)
+  )
+
+unique(zoning_res$long_code)
+
+
+```
+rename the column "zoninggrou" 
+```{r}
+zoning_res <- zoning_res %>%
+  mutate(
+    res_type = case_when(
+      grepl("^RSA", long_code) ~ "Single-Family",
+      grepl("^RM-", long_code) ~ "Multi-Family",
+      grepl("^RMX", long_code) ~ "Residential Mixed-Use",
+      grepl("^CMX", long_code) ~ "Commercial Mixed-Use",
+      TRUE ~ "Other"
+    )
+  )
+
+```
+
+```{r}
+
+
+# Transform CRS
+zoning_res <- st_transform(zoning_res, 2272)
+tracts <- st_transform(tracts, 2272)
+
+# Correct filtering using truncated field name
+zoning_res <- zoning_res %>%
+  filter(
+    zoninggrou == "Residential/Residential Mixed-Use" |
+    grepl("^RM", long_code)  |
+    grepl("^RSA", long_code) |
+    grepl("^RMX", long_code) |
+    grepl("^CMX", long_code)
+  )
+
+# Intersection using correct field
+tract_zoning_intersection <- st_intersection(
+  tracts %>% select(GEOID),
+  zoning_res %>% select(long_code, zoninggrou)
+) %>%
+  mutate(area_res_zone = st_area(geometry))
+
+# Tract areas
+tract_areas <- tracts %>%
+  mutate(area_tract = st_area(geometry)) %>%
+  st_drop_geometry() %>%
+  select(GEOID, area_tract)
+
+# Aggregate
+zoning_by_tract <- tract_zoning_intersection %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(
+    res_zone_area = sum(as.numeric(area_res_zone), na.rm = TRUE),
+    n_res_zones = n(),
+    n_zone_types = n_distinct(long_code)
+  ) %>%
+  left_join(tract_areas, by = "GEOID") %>%
+  mutate(pct_res_zoned = res_zone_area / area_tract)
+
+```
+
+```{r}
+evictions_zoned <- evictions_with_lags %>%
+  left_join(zoning_by_tract, by = "GEOID")
+
+```
+
+
+```{r}
+library(units)
+
+ggplot(evictions_zoned, aes(x = pct_res_zoned, y = eviction_filings)) +
+  geom_point(alpha = 0.3, color = "#6849BA") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title = "Relationship Between % Residential Zoning and Quarterly Evictions",
+    x = "Percent of Tract Area Zoned Residential/Mixed-Use",
+    y = "Quarterly Eviction Filings"
+  ) +
+  plotTheme
+
+```
+
+```{r}
+ggplot(evictions_zoned, aes(x = pct_res_zoned, y = evictions_lag1)) +
+  geom_point(alpha = 0.3, color = "#361AA3") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title = "1-Quarter Lagged Evictions vs. Residential Zoning Share",
+    x = "Residential Zoning Share (0–1 scale)",
+    y = "Lagged Evictions (1 Quarter)"
+  ) +
+  plotTheme
+
+
+```
+

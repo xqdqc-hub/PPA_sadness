@@ -1,0 +1,288 @@
+---
+title: "PPA_final"
+output: html_document
+date: "2025-12-03"
+---
+
+```{r}
+library(sf)
+library(dplyr)
+library(readr)
+library(janitor)
+library(lubridate)
+library(ggplot2)
+library(tidyr)
+
+```
+
+
+```{r}
+tracts <- st_read("data/tl_2020_42_tract")
+
+# 只保留 Philadelphia County（FIPS = 101）
+philly_tracts <- tracts %>% filter(COUNTYFP == "101")
+
+philly_tracts <- philly_tracts %>%
+  mutate(GEOID = paste0(STATEFP, COUNTYFP, TRACTCE))
+
+```
+1/ property data
+
+```{r}
+opa <- read_csv("data/opa_properties_public.csv") %>% clean_names()
+```
+
+```{r}
+# spatial join
+opa_xy <- opa %>%
+  filter(!is.na(shape)) %>% 
+  filter(str_detect(shape, "POINT\\(")) %>%
+  mutate(
+    shape_clean = str_remove(shape, "SRID=2272;POINT\\("),
+    shape_clean = str_remove(shape_clean, "\\)"),
+    x = as.numeric(str_split(shape_clean, " ", simplify = TRUE)[,1]),
+    y = as.numeric(str_split(shape_clean, " ", simplify = TRUE)[,2])
+  )
+
+opa_sf <- st_as_sf(
+  opa_xy,
+  coords = c("x", "y"),
+  crs = 2272,
+  remove = FALSE
+)
+
+opa_sf <- st_transform(opa_sf, crs = 4326)
+
+philly_tracts <- philly_tracts %>%
+  mutate(GEOID = paste0(STATEFP, COUNTYFP, TRACTCE)) %>%
+  st_transform(4326)
+
+opa_joined <- st_join(
+  opa_sf,
+  philly_tracts[, c("GEOID", "geometry")],
+  join = st_within
+)
+
+```
+
+```{r}
+opa_clean <- opa_joined %>%
+  # have census_tract and market_value
+  filter(!is.na(census_tract), !is.na(market_value)) %>%
+  mutate(
+    # low value dummy
+    low_value = market_value < 100000,
+    # Tax delinquency proxy
+    tax_del = (taxable_building == 0 | taxable_land == 0)
+  )
+
+
+property_summary <- opa_clean %>%
+  group_by(GEOID) %>%
+  summarise(
+    median_market_value = median(market_value, na.rm = TRUE),
+    pct_low_value = mean(low_value, na.rm = TRUE) * 100,
+    pct_tax_delinquent = mean(tax_del, na.rm = TRUE) * 100
+  )
+
+```
+
+2/ spatial data-courts
+
+```{r}
+courts <- tribble(
+  ~name, ~lon, ~lat,
+  "Municipal Court", -75.1617, 39.9496,
+  "City Hall Civil", -75.1652, 39.9526
+)
+
+courts_sf <- st_as_sf(courts, coords = c("lon", "lat"), crs = 4326)
+
+```
+
+```{r}
+tract_centroids <- st_centroid(philly_tracts)
+
+dist_mat <- st_distance(tract_centroids, courts_sf)
+
+philly_tracts$dist_to_court_km <- apply(dist_mat, 1, min) / 1000
+
+court_df <- philly_tracts %>%
+  st_drop_geometry() %>%
+  select(GEOID, dist_to_court_km)
+
+```
+
+3/ spatial data-transit stops
+
+```{r}
+transit_raw <- read_csv("data/Transit_Stops.csv") %>% clean_names()
+
+transit_sf <- transit_raw %>%
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+tract_buffer <- st_buffer(tract_centroids, dist = 800)
+
+station_join <- st_join(tract_buffer, transit_sf)
+
+transit_summary <- station_join %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(n_stations_800m = n())
+
+```
+4/ spatial data-crime
+
+```{r}
+crime <- read_csv("data/incidents_part1_part2.csv") %>% clean_names()
+
+crime_sf <- crime %>%
+  filter(!is.na(lat), !is.na(lng)) %>%
+  st_as_sf(coords = c("lng", "lat"), crs = 4326)
+
+crime_join <- st_join(
+  philly_tracts,
+  crime_sf,
+  join = st_contains
+)
+
+crime_summary <- crime_join %>%
+  st_drop_geometry() %>% 
+  group_by(GEOID) %>%
+  summarise(
+    total_crimes = n()
+  )
+
+```
+
+```{r}
+library(jsonlite)
+library(dplyr)
+
+# ACS 2022, Table B01003_001E (Total Population)
+url <- "https://api.census.gov/data/2022/acs/acs5?get=B01003_001E,NAME&for=tract:*&in=state:42%20county:101"
+
+philly_pop_raw <- fromJSON(url)
+
+philly_pop <- as.data.frame(philly_pop_raw[-1, ], stringsAsFactors = FALSE)
+
+names(philly_pop) <- c("population", "NAME", "state", "county", "tract")
+
+philly_pop <- philly_pop %>%
+  mutate(
+    population = as.numeric(population),
+    GEOID = paste0(state, county, tract)
+  ) %>%
+  select(GEOID, population)
+
+crime_summary <- crime_summary %>%
+  left_join(philly_pop, by = "GEOID") %>%
+  mutate(
+    crime_rate = total_crimes / (population / 1000)
+  )
+
+```
+
+5/ summary&data exploration
+```{r}
+final_df <- philly_tracts %>%
+  st_drop_geometry() %>%
+  select(GEOID) %>%
+  left_join(property_summary, by = "GEOID") %>%
+  left_join(court_df, by = "GEOID") %>%
+  left_join(transit_summary, by = "GEOID") %>%
+  left_join(crime_summary, by = "GEOID") %>%
+  drop_na()
+
+```
+
+```{r}
+summary(final_df)
+```
+```{r}
+st_write(philly_map, "data/property&spatial_notclean.geojson", delete_dsn = TRUE)
+```
+
+
+
+
+6/ clean error data(the data will be less than 408 obs, not sure whether do it)
+```{r}
+final_df_clean <- final_df %>%
+  filter(population > 0)
+
+Q1 <- quantile(final_df_clean$median_market_value, 0.25, na.rm = TRUE)
+Q3 <- quantile(final_df_clean$median_market_value, 0.75, na.rm = TRUE)
+IQR_val <- Q3 - Q1
+
+upper_bound_price <- Q3 + 3 * IQR_val
+lower_bound_price <- max(0, Q1 - 3 * IQR_val)
+
+final_df_clean <- final_df_clean %>%
+  filter(
+    median_market_value >= lower_bound_price,
+    median_market_value <= upper_bound_price
+  )
+
+final_df_clean <- final_df_clean %>%
+  filter(is.finite(crime_rate))
+
+upper_crime <- quantile(final_df_clean$crime_rate, 0.99, na.rm = TRUE)
+
+lower_crime <- quantile(final_df_clean$crime_rate, 0.01, na.rm = TRUE)
+
+final_df_clean <- final_df_clean %>%
+  filter(
+    crime_rate >= lower_crime,
+    crime_rate <= upper_crime
+  )
+
+```
+
+```{r}
+summary(final_df_clean)
+```
+```{r}
+philly_map_clean <- philly_tracts %>%
+  left_join(final_df_clean, by = "GEOID")
+```
+
+```{r}
+library(ggplot2)
+library(sf)
+library(viridis)
+library(patchwork)
+
+plot_map <- function(data, var, title) {
+  ggplot(data) +
+    geom_sf(aes(fill = .data[[var]]), color = NA) +
+    scale_fill_viridis(option = "plasma", na.value = "grey80") +
+    labs(title = title, fill = var) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 8, face = "bold"),
+      legend.key.height = unit(0.4, "cm"),
+      legend.key.width  = unit(0.3, "cm"),
+      legend.text = element_text(size = 4),
+      legend.title = element_text(size = 4),
+      legend.spacing = unit(0.2, "cm"),
+      legend.position = "right",
+      axis.text = element_blank(),
+      axis.title = element_blank()
+    )
+}
+
+p1 <- plot_map(philly_map_clean, "median_market_value", "Median Market Value")
+p2 <- plot_map(philly_map_clean, "pct_low_value", "Low Value Homes (%)")
+p3 <- plot_map(philly_map_clean, "pct_tax_delinquent", "Tax Delinquency (%)")
+p4 <- plot_map(philly_map_clean, "dist_to_court_km.y", "Distance to Court (km)")
+p5 <- plot_map(philly_map_clean, "crime_rate", "Crime Rate")
+p6 <- plot_map(philly_map_clean, "n_stations_800m", "Transit Stops ≤ 800m")
+
+(p1 | p2 | p3) /
+(p4 | p5 | p6) 
+
+```
+```{r}
+st_write(philly_map_clean, "data/philly_final.geojson", delete_dsn = TRUE)
+```
