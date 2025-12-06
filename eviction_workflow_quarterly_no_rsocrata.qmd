@@ -57,12 +57,20 @@ We therefore build a **tract–quarter** modeling dataset, while still allowing 
 This QMD documents a reproducible workflow to build a tract–quarter modeling dataset:
 
 1.  Download Philadelphia census tract boundaries\
+
 2.  Collect ACS socioeconomic and housing indicators\
+
 3.  Collect and aggregate OPA property assessment data (via CSV API, no RSocrata)\
+
 4.  Construct spatial features (distance to courts; optional transit and crime features)\
+
 5.  Process eviction records into tract–quarter format\
-6.  Create quarterly lagged eviction variables\
-7.  Merge all data into a final modeling dataset
+
+6.  Create quarterly lagged eviction variables
+
+7.  Exploratory data analysis\
+
+8.  Merge all data into a final modeling dataset
 
 ------------------------------------------------------------------------
 
@@ -240,7 +248,7 @@ write.csv(acs_final, "acs_final.csv", row.names = FALSE)
 
 ```
 
-# 5. Step 3: OPA Property Assessment Data 
+# 5. Step 3: OPA Property Assessment Data
 
 We use the Carto SQL API exposed by the City of Philadelphia and read it as CSV.
 
@@ -274,6 +282,13 @@ head(property_summary)
 > If column names differ (e.g., `market_value`, `category_code_description`), adjust them based on `names(opa_raw)`.
 
 ------------------------------------------------------------------------
+
+```{r}
+opa_clean <- st_read("data/property&spatial.geojson")
+names(opa_clean)
+names(philly_final)
+
+```
 
 # 6. Step 4: Spatial Features
 
