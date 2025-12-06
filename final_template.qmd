@@ -1,0 +1,590 @@
+---
+title: "Final"
+output: html_document
+author: "Your Name"
+date: "2025-12-06"
+---
+
+# Introduction
+
+Evictions represent a critical indicator of neighborhood instability and social vulnerability.  
+In this project, our **dependent variable** is:
+
+**Quarterly eviction total for 2024, aggregated at the census tract level in Philadelphia.**
+
+Our core research question is:
+
+**Can we predict quarterly eviction filing counts at the census-tract level 1–3 months (i.e., 1 quarter) in advance, enabling the City of Philadelphia to proactively deploy rental assistance, legal aid resources, and community outreach?**
+
+Spatial Unit: Census tract
+Temporal Unit: Quarterly
+Outcome: Number of eviction filings per tract per quarter
+Model: Poisson / Negative Binomial (count outcome), or logistic if we binarize high-risk vs low-risk tracts
+
+
+**Why Use Quarterly Data?**
+
+Monthly eviction filings are often noisy and volatile.
+Aggregating to quarters (3-month periods) smooths short-term fluctuations and better aligns with: Budget cycles, Program planning cycles, Policy reporting (quarterly dashboards)
+
+We therefore build a tract–quarter modeling dataset, while still allowing lag structures that represent 1, 2, 4 quarters in the past.
+
+We incorporate three major categories of predictors:
+
+1. **Structural characteristics** from ACS and property assessment data  
+2. **Spatial environmental features** such as crime and transit accessibility  
+3. **Temporal dynamics**, including:
+   - **Lag 1 quarter** (previous quarter’s evictions)
+   - **Lag 2 = Lag 4 quarters** (same quarter in the previous year)
+
+Our goal is to build and compare multiple statistical and spatial models to determine which approach most accurately predicts tract-level eviction activity.
+
+---
+
+# Data Preparation and Cleaning
+
+This section describes the construction of the final analysis dataset, integrating multiple sources.
+
+```{r}
+library(tidycensus)
+library(sf)
+library(dplyr)
+library(readr)
+library(zoo)
+library(lubridate)
+library(ggplot2)
+library(stringr)
+library(tidyverse)
+
+```
+
+## Census Tracks
+```{r}
+philly_tracts <- get_acs(
+  geography = "tract",
+  state = "PA",
+  county = "Philadelphia",
+  variables = "B01001_001",  # total population, used just to get geometry
+  year = 2022,
+  geometry = TRUE
+)
+
+philly_tracts_sf <- philly_tracts %>% 
+  select(GEOID, geometry)
+
+philly_tracts_sf
+```
+
+
+## Dependent Variable: 2024 Quarterly Eviction Totals
+Eviction filing data from 2021–2024 were collected and aggregated to the tract–quarter level.  
+Quarterly lags were computed to represent short-term momentum (lag 1) and annual seasonal effects (lag 2 / lag 4).
+
+```{r}
+evictions_raw <- read.csv("data/philadelphia_weekly_2020_2021.csv")
+
+evictions_quarterly <- evictions_raw %>%
+  mutate(
+    week_date = ymd(week_date),
+    year = year (week_date),
+    quarter = quarter(week_date),
+    year_quarter = paste0(year, "-Q", quarter)
+  ) %>%
+  # aggregate to quarterly by tract 
+  group_by(GEOID, year_quarter, year, quarter, racial_majority, filings_avg,filings_avg_prepandemic_baseline, filings_2020) %>%
+  summarize(
+    eviction_filings = sum(filings_2020, na.rm = TRUE),
+    weeks_in_quarter = n(),
+    .groups = "drop"
+  )
+
+cat("Quarterly data created:\n")
+cat("Rows:", nrow(evictions_quarterly), "\n")
+cat("Unique tracts:", n_distinct(evictions_quarterly$GEOID), "\n")
+cat("Time periods:", paste(unique(evictions_quarterly$year_quarter), collapse = ", "), "\n\n")
+```
+## Structural Variables
+Structural characteristics include:
+- Population, income, poverty indicators, renter share, and other ACS socioeconomic metrics  
+- Median property value, low-value housing share, and tax delinquency proxy from OPA assessments  
+
+These variables capture neighborhood housing vulnerability and socioeconomic risk factors.
+
+### ACS factors
+
+```{r}
+acs_vars <- c(
+  # Demographics
+  total_pop          = "B01001_001",
+  white_pop          = "B02001_002",
+  black_pop          = "B02001_003",
+  asian_pop          = "B02001_005",
+  hispanic_pop       = "B03003_003",
+
+  # Economic indicators
+  median_income      = "B19013_001",
+  poverty_total      = "B17001_001",
+  poverty_below      = "B17001_002",
+  unemployment_total = "B23025_002",
+  unemployment_unemployed = "B23025_005",
+
+  # Housing & tenure
+  total_housing_units = "B25001_001",
+  renter_occupied     = "B25003_003",
+  median_rent         = "B25064_001",
+  median_home_value   = "B25077_001",
+
+  # Rent burden distribution
+  rent_30_to_35_pct   = "B25070_007",
+  rent_35_to_40_pct   = "B25070_008",
+  rent_40_to_50_pct   = "B25070_009",
+  rent_50_plus_pct    = "B25070_010",
+
+  # Housing age & vacancy
+  median_year_built   = "B25037_001",
+  vacant_units        = "B25002_003",
+
+  # Education - Less than high school (B15003 table)
+  edu_total           = "B15003_001",
+  less_than_hs_2      = "B15003_002",
+  less_than_hs_3      = "B15003_003",
+  less_than_hs_4      = "B15003_004",
+  less_than_hs_5      = "B15003_005",
+  less_than_hs_6      = "B15003_006",
+  less_than_hs_7      = "B15003_007",
+  less_than_hs_8      = "B15003_008",
+  less_than_hs_9      = "B15003_009",
+  less_than_hs_10     = "B15003_010",
+  less_than_hs_11     = "B15003_011",
+  less_than_hs_12     = "B15003_012",
+  less_than_hs_13     = "B15003_013",
+  less_than_hs_14     = "B15003_014",
+  less_than_hs_15     = "B15003_015",
+  less_than_hs_16     = "B15003_016"
+)
+
+acs_raw <- get_acs(
+  geography = "tract",
+  state = "PA",
+  county = "Philadelphia",
+  variables = acs_vars,
+  year = 2022,
+  output = "wide",
+  geometry = FALSE
+)
+
+acs_final <- acs_raw %>%
+  mutate(
+    # -------------------------
+    # Race composition
+    # -------------------------
+    pct_white     = white_popE     / total_popE * 100,
+    pct_black     = black_popE     / total_popE * 100,
+    pct_hispanic  = hispanic_popE  / total_popE * 100,
+    pct_asian     = asian_popE     / total_popE * 100,
+
+    # -------------------------
+    # Poverty & unemployment
+    # -------------------------
+    poverty_rate      = poverty_belowE / poverty_totalE * 100,
+    unemployment_rate = unemployment_unemployedE / unemployment_totalE * 100,
+
+    # -------------------------
+    # Tenure & rent burden
+    # -------------------------
+    pct_renter        = renter_occupiedE / total_housing_unitsE * 100,
+    rent_burdened     = rent_30_to_35_pctE + rent_35_to_40_pctE +
+                        rent_40_to_50_pctE + rent_50_plus_pctE,
+    pct_rent_burdened = rent_burdened / renter_occupiedE * 100,
+    pct_severe_burden = rent_50_plus_pctE / renter_occupiedE * 100,
+
+    # -------------------------
+    # Education – Less than High School
+    # -------------------------
+    less_than_hs = less_than_hs_2E + less_than_hs_3E + less_than_hs_4E +
+                   less_than_hs_5E + less_than_hs_6E + less_than_hs_7E +
+                   less_than_hs_8E + less_than_hs_9E + less_than_hs_10E +
+                   less_than_hs_11E + less_than_hs_12E + less_than_hs_13E +
+                   less_than_hs_14E + less_than_hs_15E + less_than_hs_16E,
+
+    pct_less_than_hs = less_than_hs / edu_totalE * 100,
+
+    # -------------------------
+    # Housing age
+    # -------------------------
+    property_age  = 2024 - median_year_builtE
+  ) %>%
+  select(
+    GEOID,
+    total_popE,
+    pct_white, pct_black, pct_hispanic, pct_asian,
+    poverty_rate, unemployment_rate,
+    median_incomeE, pct_renter,
+    pct_rent_burdened, pct_severe_burden,
+    pct_less_than_hs,              # <- newly added education variable
+    median_rentE, median_home_valueE,
+    property_age, vacant_unitsE
+  ) %>%
+  rename(
+    total_pop         = total_popE,
+    median_income     = median_incomeE,
+    median_rent       = median_rentE,
+    median_home_value = median_home_valueE,
+    vacant_units      = vacant_unitsE
+  )
+
+head(acs_final)
+write.csv(acs_final, "acs_final.csv", row.names = FALSE)
+```
+
+### Property Data
+```{r}
+opa <- read_csv("data/opa_properties_public.csv")
+```
+```{r}
+# spatial join
+opa_xy <- opa %>%
+  filter(!is.na(shape)) %>% 
+  filter(str_detect(shape, "POINT\\(")) %>%
+  mutate(
+    shape_clean = str_remove(shape, "SRID=2272;POINT\\("),
+    shape_clean = str_remove(shape_clean, "\\)"),
+    x = as.numeric(str_split(shape_clean, " ", simplify = TRUE)[,1]),
+    y = as.numeric(str_split(shape_clean, " ", simplify = TRUE)[,2])
+  )
+
+opa_sf <- st_as_sf(
+  opa_xy,
+  coords = c("x", "y"),
+  crs = 2272,
+  remove = FALSE
+)
+
+opa_sf <- st_transform(opa_sf, crs = 4326)
+
+philly_tracts <- philly_tracts %>%
+  st_transform(4326)
+
+opa_joined <- st_join(
+  opa_sf,
+  philly_tracts[, c("GEOID", "geometry")],
+  join = st_within
+)
+
+opa_clean <- opa_joined %>%
+  # have census_tract and market_value
+  filter(!is.na(census_tract), !is.na(market_value)) %>%
+  mutate(
+    # low value dummy
+    low_value = market_value < 100000,
+    # Tax delinquency proxy
+    tax_del = (taxable_building == 0 | taxable_land == 0)
+  )
+
+
+property_summary <- opa_clean %>%
+  group_by(GEOID) %>%
+  summarise(
+    median_market_value = median(market_value, na.rm = TRUE),
+    pct_low_value = mean(low_value, na.rm = TRUE) * 100,
+    pct_tax_delinquent = mean(tax_del, na.rm = TRUE) * 100
+  )
+
+```
+
+
+
+## Spatial Variables
+Spatial features representing public safety and accessibility include:
+- **Crime activity** aggregated via spatial joins to census tracts  
+- **Transit accessibility**, measured through density of stations within walking distance  
+
+These variables quantify environmental exposure that may influence eviction risk.
+```{r}
+tract_centroids <- st_centroid(philly_tracts)
+
+transit_raw <- read_csv("data/Transit_Stops.csv")
+
+transit_sf <- transit_raw %>%
+  st_as_sf(coords = c("Lon", "Lat"), crs = 4326)
+
+tract_buffer <- st_buffer(tract_centroids, dist = 800)
+
+station_join <- st_join(tract_buffer, transit_sf)
+
+transit_summary <- station_join %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  summarise(n_stations_800m = n())
+```
+```{r}
+crime <- read_csv("data/incidents_part1_part2.csv")
+
+crime_sf <- crime %>%
+  filter(!is.na(lat), !is.na(lng)) %>%
+  st_as_sf(coords = c("lng", "lat"), crs = 4326)
+
+crime_join <- st_join(
+  philly_tracts,
+  crime_sf,
+  join = st_contains
+)
+
+crime_summary <- crime_join %>%
+  st_drop_geometry() %>% 
+  group_by(GEOID) %>%
+  summarise(
+    total_crimes = n()
+  )
+```
+```{r}
+library(jsonlite)
+library(dplyr)
+
+# ACS 2022, Table B01003_001E (Total Population)
+url <- "https://api.census.gov/data/2022/acs/acs5?get=B01003_001E,NAME&for=tract:*&in=state:42%20county:101"
+
+philly_pop_raw <- fromJSON(url)
+
+philly_pop <- as.data.frame(philly_pop_raw[-1, ], stringsAsFactors = FALSE)
+
+names(philly_pop) <- c("population", "NAME", "state", "county", "tract")
+
+philly_pop <- philly_pop %>%
+  mutate(
+    population = as.numeric(population),
+    GEOID = paste0(state, county, tract)
+  ) %>%
+  select(GEOID, population)
+
+crime_summary <- crime_summary %>%
+  left_join(philly_pop, by = "GEOID") %>%
+  mutate(
+    crime_rate = total_crimes / (population / 1000)
+  )
+
+```
+## Temporal Lags
+Two temporal lag measures were added:
+- **Lag 1 (t–1 quarter):** captures short-term persistence  
+- **Lag 2 (t–4 quarters):** captures seasonal effects across years  
+
+Together these create a panel-like structure enabling spatiotemporal modeling.
+
+All variables were merged into a unified census-tract-level dataset for 2024 modeling and performance evaluation.
+
+```{r}
+evictions_with_lags <- evictions_quarterly %>%
+  arrange(GEOID, year, quarter) %>%
+  group_by(GEOID) %>%
+  mutate(
+    evictions_lag1Q  = lag(eviction_filings, 1),  # 1 quarter ago (~3 months)
+    evictions_lag2Q  = lag(eviction_filings, 2),  # 2 quarters (~6 months)
+    evictions_lag4Q  = lag(eviction_filings, 4),  # 4 quarters (~12 months)
+
+    # Rolling means in quarters (e.g., average over last 2 or 4 quarters)
+    evictions_avg_2Q = rollmean(eviction_filings, k = 2, fill = NA, align = "right"),
+    evictions_avg_4Q = rollmean(eviction_filings, k = 4, fill = NA, align = "right")
+  ) %>%
+  ungroup()
+
+head(evictions_with_lags)
+```
+```{r}
+evictions_2024_raw <- evictions_with_lags %>%
+  filter(year == 2024)
+
+numeric_cols <- evictions_2024_raw %>%
+  select(where(is.numeric)) %>%
+  names()
+
+evictions_2024_quarterly <- evictions_2024_raw %>%
+  group_by(GEOID, year_quarter) %>%
+  summarise(
+    across(all_of(numeric_cols), sum, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+```
+
+
+## Merge All Data
+```{r}
+final_panel <- evictions_2024_quarterly %>%
+  # 1. Join ACS structural data
+  left_join(acs_final, by = "GEOID") %>%
+  
+  # 2. Join Property structural indicators
+  left_join(property_summary, by = "GEOID") %>%
+  
+  # 3. Join spatial transit accessibility
+  left_join(transit_summary, by = "GEOID") %>%
+  
+  # 4. Join crime + crime_rate
+  left_join(crime_summary, by = "GEOID") %>%
+  
+  # 5. Join geometry (for mapping only)
+  left_join(philly_tracts_sf, by = "GEOID")
+
+# Print summary
+cat("\nMerged dataset created successfully.\n")
+cat("Rows:", nrow(final_panel), "\n")
+cat("Columns:", ncol(final_panel), "\n")
+cat("Unique tracts:", n_distinct(final_panel$GEOID), "\n\n")
+
+# Optional: save final merged table
+write_csv(st_drop_geometry(final_panel), "data/final_panel_no_geometry.csv")
+st_write(final_panel, "data/final_panel.geojson", delete_dsn = TRUE)
+
+```
+
+
+
+
+---
+
+# Exploration
+
+This section presents exploratory data analysis, focusing on spatial patterns and distributional characteristics.
+
+## Eviction Data Analysis
+- Mapping quarterly eviction totals to visualize spatial clustering  
+- Distributional summaries of eviction variations across tracts  
+- **Local Indicators of Spatial Association (LISA)** to identify hotspots and coldspots  
+- Time-series inspection of lag relationships
+
+## Crime and Environmental Context
+- Spatial distribution of crime events and crime rates  
+- **K-Nearest Neighbor (KNN)** spatial diagnostics for crime concentrations  
+- Comparison with eviction clusters to explore co-location patterns
+
+## Structural and Spatial Features
+- Mapping ACS variables, property indicators, and transit accessibility  
+- Correlation analysis to detect multicollinearity  
+- Exploration of spatial autocorrelation in predictors
+
+This exploratory stage guides expectations about which models may best capture the relationships in eviction dynamics.
+
+
+
+
+
+---
+
+# Modeling
+
+We estimate five classes of models, progressing from simple to fully spatiotemporal.
+
+## Model 1 — Baseline OLS (Cross-sectional)
+**Specification:**Evict_2024 ~ ACS + property + spatial
+
+**Purpose:**  
+A simple benchmark without temporal or spatial components.
+
+---
+
+## Model 2 — Time-lagged OLS
+**Specification:**Evict_2024 ~ Evict_2023 + ACS + property + spatial
+
+**Benefits:**  
+- Captures strong short-term temporal dependence  
+- Substantially improves predictive accuracy compared to Model 1  
+
+---
+
+## Model 3 — Count Data Models (Poisson / Negative Binomial)
+
+Eviction counts are non-negative and often overdispersed.  
+The Negative Binomial model is suitable for this setting.
+
+**Specification:**NB(Evict_2024) ~ Evict_2023 + ACS + property + spatial
+
+**Benefits:**  
+- Handles overdispersion  
+- More appropriate distributional assumptions  
+- Reduces bias in high-variance tracts  
+
+---
+
+## Model 4 — Spatial Lag Models (SAR / SLX)
+
+Evictions exhibit spatial spillover effects.
+
+### SLX Model:
+Evict_2024 ~ Evict_2023 + X + W * X
+
+Captures spatial spillover in predictors.
+
+### SAR Model:
+Evict_2024 = ρ (W * Evict_2024) + βX + ε
+
+Captures spatial dependence directly in the outcome.
+
+**What these models capture:**  
+- Eviction activity in one tract influences nearby tracts  
+- Demonstrates neighborhood-level externalities  
+
+---
+
+## Model 5 — Spatiotemporal Lag Model (Best Theoretical Model)
+
+Combines temporal and spatial autocorrelation:
+Evict_2024 ~ Evict_2023 + W * Evict_2023 + X + W * X
+
+
+This model incorporates:
+- **Short-term temporal dependence**  
+- **Spatial spillover of both outcomes and predictors**  
+- **Structural and environmental risk factors**
+
+This yields the most complete representation of eviction processes across space and time.
+
+
+
+
+---
+
+# Model Diagnostics and Validation
+
+To evaluate model performance and generalizability, we conduct:
+
+## Cross-validation on 2024 Quarters
+- Train models on earlier quarters  
+- Validate predictions on later quarters (e.g., Q3 → Q4)  
+- Evaluate RMSE, MAE, R², and residual spatial autocorrelation  
+
+## Out-of-sample Prediction: 2025 Eviction Forecast
+Using the best-performing model(s), we generate forecasts for:
+- 2025Q1  
+- 2025 annual aggregated prediction  
+
+Comparison highlights model stability and predictive effectiveness.
+
+## Residual Diagnostics
+- Spatial autocorrelation in residuals (Moran’s I)  
+- Heteroskedasticity checks  
+- Goodness-of-fit comparisons across models  
+
+
+
+
+
+---
+
+# Conclusion
+
+This study integrates structural, spatial, and temporal factors to predict tract-level eviction filings in Philadelphia. Using quarterly data and a suite of increasingly sophisticated models, we demonstrate:
+
+- Temporal lags are powerful predictors of eviction activity  
+- Spatial dependencies play a substantial role in neighborhood eviction dynamics  
+- Count models and spatiotemporal lag models offer superior predictive performance  
+- The strongest models effectively forecast both 2024 cross-validation and 2025 eviction levels  
+
+These findings highlight the necessity of incorporating **both time and space** when modeling housing instability, and provide a framework for designing predictive tools that can inform eviction prevention policy and resource allocation.
+
+
+
+
+
+
+
